@@ -2,6 +2,8 @@
 
 The sparsekmeans package provides an efficient implementation of the K-means clustering algorithm optimized for sparse data sets. It is designed to handle high-dimensional and sparse data commonly found in text mining, recommender systems, and bioinformatics. By leveraging appropriate storage format and sparse matrix multiplication operations, our package ensures significant speedup in running time while maintaining consistency for clustering results compared with scikit-learn. Besides, the design of the package allows users to easily extend and customize, making it suitable for research or integrating into large-scale machine learning systems.
 
+Implementation details are in the paper ["SparseKmeans: Efficient K-means Clustering for Sparse Data"](https://www.csie.ntu.edu.tw/~cjlin/papers/sparse_kmeans/sparsekmeans-cikm.pdf), CIKM 2025.
+
 ## Installation
 
 Use the following command to install sparsekmeans with python >= 3.10.
