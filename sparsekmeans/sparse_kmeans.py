@@ -52,6 +52,10 @@ def check_centroids_density(centroids: gb.Matrix):
 
 
 def predict_labels(X: gb.Matrix, centroids: gb.Matrix, is_centroid_dense: bool, n_threads: int=default_threads):
+    if X.dtype != dtypes.FP64:
+        X = X.dup(dtype="FP64")
+    if centroids.dtype != dtypes.FP64:
+        centroids = centroids.dup(dtype="FP64")
     n_samples = X.shape[0]
     n_clusters = centroids.shape[0]
 
@@ -298,6 +302,8 @@ class SparseKmeans:
 
         if not isinstance(X, gb.Matrix):
             X = gb.io.from_scipy_sparse(X)
+        if X.dtype != dtypes.FP64:
+            X = X.dup(dtype="FP64")
 
         start_init_centroids = time.time()
         self.centroids = self._initialize_centroids(X)
