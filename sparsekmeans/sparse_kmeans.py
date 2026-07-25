@@ -33,7 +33,7 @@ def squared_row_norms(X: gb.Matrix, n_threads: int=default_threads):
 
 
 def check_centroids_density(centroids: gb.Matrix):
-    gamma = 0.1
+    gamma = 0.05
 
     if centroids.ss.format == "fullr":
         is_centroid_dense = True
@@ -69,16 +69,13 @@ def predict_labels(X: gb.Matrix, centroids: gb.Matrix, is_centroid_dense: bool, 
         centroids = centroids.ss.export("fullc")
         centroids = gb.Matrix.ss.import_fullc(**centroids)
 
-        XCt << 0
-        XCt(accum=gb.binary.plus, nthreads=n_threads) << X.mxm(centroids.T)
-        XCt = 2 * XCt.to_dense()
-
     else:
         centroids = centroids.ss.export("csc")
         centroids = gb.Matrix.ss.import_csc(**centroids)
 
-        XCt(nthreads=n_threads) << X.mxm(centroids.T)
-        XCt = 2 * XCt.to_dense(fill_value=0)
+    XCt << 0
+    XCt(accum=gb.binary.plus, nthreads=n_threads) << X.mxm(centroids.T)
+    XCt = 2 * XCt.to_dense()
 
     # x_squared_norms is not needed
     c_squared_norms = squared_row_norms(centroids, n_threads)
@@ -361,6 +358,7 @@ class SparseKmeans:
         # If a selected point belongs to a cluster with only one point, we skip it and move on to the next furthest point.
         # Each empty cluster gets one point
         # We also need to update cluster_sizes
+        # See Algorithm E.1 in supplementary materials of Dang et al., CIKM 2025.
         if n_empty > 0:
             far_samples_idx = np.argsort(self.sample_centroids_closest_distance)[:: -1]
             i, j = 0, 0
