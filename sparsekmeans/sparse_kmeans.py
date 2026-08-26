@@ -361,22 +361,20 @@ class SparseKmeans:
         # See Algorithm E.1 in supplementary materials of Dang et al., CIKM 2025.
         if n_empty > 0:
             far_samples_idx = np.argsort(self.sample_centroids_closest_distance)[:: -1]
-            i, j = 0, 0
+            k, j = 0, 0
             
-            while i < n_samples - n_empty and j < n_empty:
-                origin_cluster = self.labels[far_samples_idx[i]]
-                i += 1
+            while k < n_samples - n_empty and j < n_empty:
+                origin_cluster = self.labels[far_samples_idx[k]]
 
-                if cluster_sizes[origin_cluster] == 1:
-                    continue
-
-                target_empty_cluster = empty_clusters[j]
-                cluster_sizes[origin_cluster] -= 1
-                cluster_sizes[target_empty_cluster] = 1
-                self.labels[far_samples_idx[i]] = target_empty_cluster
-                j += 1
+                if cluster_sizes[origin_cluster] > 1:
+                    target_empty_cluster = empty_clusters[j]
+                    cluster_sizes[origin_cluster] -= 1
+                    cluster_sizes[target_empty_cluster] = 1
+                    self.labels[far_samples_idx[k]] = target_empty_cluster
+                    j += 1
+                k +=1
             
-            if i == n_samples - n_empty:
+            if k == n_samples - n_empty:
                 raise ValueError("Not enough distinct points to assign to empty clusters.")
 
         # Get the weight of each sample in its corresponding cluster
