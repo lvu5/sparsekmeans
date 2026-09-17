@@ -12,6 +12,12 @@ Use the following command to install sparsekmeans with python >= 3.10.
 pip install sparsekmeans
 ```
 
+GPU acceleration is also supported for CUDA 12 and 13. For example, users can install the GPU-enabled version with:
+
+```bash
+pip install "sparsekmeans[gpu-cu12]"
+```
+
 ## Usage
 
 We support two popular K-means algorithms: Lloyd's method and Elkan's method. While both require distance calculations between data points and centroids, Elkan's method reduces some computations by exploiting information from the previous iteration, specifically using the triangle inequality to maintain two distance-related bounds.
@@ -25,6 +31,13 @@ from sparsekmeans import LloydKmeans, ElkanKmeans
 
 kmeans = LloydKmeans(n_clusters=100)
 kmeans = ElkanKmeans(n_clusters=100)
+labels = kmeans.fit(X)
+```
+
+To use GPU acceleration for Lloyd's method, set `use_gpu=True`. The GPU-enabled installation is required; otherwise, an exception will be raised.
+
+```
+kmeans = LloydKmeans(n_clusters=100, use_gpu=True)
 labels = kmeans.fit(X)
 ```
 
@@ -50,12 +63,19 @@ To cluster additional data by using previously obtained centroids, use the follo
 
 ```
 test_labels = kmeans.predict(Xtest)
+
+# To enable GPU acceleration, pass use_gpu=True:
+test_labels = kmeans.predict(Xtest, use_gpu=True)
 ```
 
 In case users have defined their own centroids and want to use them for clustering data, our package provides a function to do that:
 ```
 from sparsekmeans import kmeans_predict
+
 test_labels = kmeans_predict(Xtest, user_defined_centroids)
+
+# To enable GPU acceleration, pass use_gpu=True:
+test_labels = kmeans_predict(Xtest, user_defined_centroids, use_gpu=True)
 ```
 
 ## Example
@@ -76,12 +96,17 @@ kmeans = LloydKmeans(n_clusters=100)
 labels = kmeans.fit(X)
 ```
 
+## Note:
+Sparse matrix should not contain duplicate entries. Duplicate entries may cause errors or incorrect behavior during sparse matrix multiplication.
+
 ## Benchmark
+
+### CPU Benchmark
 
 Running time comparison for **Lloyd's** algorithm
 
 
-| Data sets    | 𝑲  |       sklearn          |  sparsekmeans |  Speedup |
+| Data sets    | K  |       sklearn          |  sparsekmeans |  Speedup |
 |-------------:|------------:|---------------------:|-----:|-------------:|
 | Wiki-500K   | 100 | 24,617.7    | 2,957.3        | 8.32x   |
 |             | 500 | > $10^5$ | 26,104.9       | > 3.83x |
@@ -94,7 +119,7 @@ Running time comparison for **Lloyd's** algorithm
 
 Running time comparison for **Elkan's** algorithm
 
-| Data sets    | 𝑲  |      sklearn          |  sparsekmeans |  Speedup |
+| Data sets    | K  |      sklearn          |  sparsekmeans |  Speedup |
 |-------------:|------------:|---------------------:|-----:|-------------:|
 | Wiki-500K   | 100 | 4,042.7    | 2,382.1        | 1.69x   |
 |             | 500 | 91,441.8 | 5,061.0       | 18.06x |
@@ -104,3 +129,20 @@ Running time comparison for **Elkan's** algorithm
 |             | 500 | 4,687.1     | 1,989.7          | 2.35x  |
 | Amazon-3M   | 100 | 2,965.2    | 1,743.4        | 1.70x  |
 |             | 500 | 13,340.0 | 5,517.9       | 2.41x|
+
+### GPU Benchmark
+
+Our current GPU implementation supports Lloyd's algorithm.
+
+The GPU benchmark uses smaller data sets than the CPU benchmark because the larger data sets exceed the available GPU memory. Among them, Small URL is a subsampled version of the Url data set.
+
+
+| Data sets    | K  | GPU (s) | CPU (s) | Speedup |
+|-------------:|----:|--------:|--------:|--------:|
+| EUR-Lex      | 100  | 2.28   | 4.23   | 1.86x   |
+|              | 500  | 5.94   | 11.01  | 1.85x   |
+| Wiki10-31K   | 100  | 18.46  | 69.88  | 3.79x   |
+|              | 500  | 99.38  | 943.29 | 9.49x   |
+| Small URL    | 100  | 32.18  | 57.13  | 1.78x   |
+|              | 500  | 186.66 | 338.96 | 1.82x   |
+|              | 1000 | 318.57 | 548.92 | 1.72x   |

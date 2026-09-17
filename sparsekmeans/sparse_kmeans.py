@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import sys
 import numpy as np
@@ -12,6 +13,26 @@ from graphblas import Matrix, Vector, dtypes
 import gc
 
 default_threads = max(1, os.cpu_count() // 2)
+
+def _load_gpu_backend():
+    try:
+        import cupy as cp
+        import cupyx
+        import cupyx.scipy.sparse as csp
+        from .cupy_utils import spmm
+    except ImportError as exc:
+        raise ImportError(
+            "GPU support requires cupy and CUDA Toolkit."
+        ) from exc
+
+    return cp, cupyx, csp, spmm
+
+def _scipy_csr_to_cupy_csr(X: sparse.csr_matrix):
+    _, _, csp, _ = _load_gpu_backend()
+    # Sum duplicate CSR entries on CPU before moving to CuPy. On GPU, handling duplicated entries causes extra GPU memory usage and slower matrix multiplication.
+    X.sum_duplicates()
+    X = csp.csr_matrix(X)
+    return X
 
 def check_random_state(seed: Union[int, None]):
     # Generate a global random number generator (global RNG) - a RandomState instance
@@ -51,42 +72,60 @@ def check_centroids_density(centroids: gb.Matrix):
     return centroids, is_centroid_dense
 
 
-def predict_labels(X: gb.Matrix, centroids: gb.Matrix, is_centroid_dense: bool, n_threads: int=default_threads):
-    if X.dtype != dtypes.FP64:
-        X = X.dup(dtype="FP64")
-    if centroids.dtype != dtypes.FP64:
-        centroids = centroids.dup(dtype="FP64")
+def predict_labels(X: Union[gb.Matrix, csp.csr_matrix], centroids: gb.Matrix, is_centroid_dense: bool, n_threads: int=default_threads, gpu: bool=False):
+    # Force all data to FP64 to avoid data type casting during matrix multiplication, which may degrade performance.
+    if gpu:
+        cp, cupyx, csp, spmm = _load_gpu_backend()
+        if isinstance(X, gb.Matrix):
+            X = sparse.csr_matrix(gb.io.to_scipy_sparse(X, format="csr"), dtype=np.float64)
+            X = _scipy_csr_to_cupy_csr(X)
+    else:
+        if X.dtype != dtypes.FP64:
+            X = X.dup(dtype="FP64")
+        if centroids.dtype != dtypes.FP64:
+            centroids = centroids.dup(dtype="FP64")
     n_samples = X.shape[0]
     n_clusters = centroids.shape[0]
 
     # x_squared_norms is not needed
     c_squared_norms = squared_row_norms(centroids, n_threads)
-    XCt = Matrix(dtypes.FP64, nrows=n_samples, ncols=n_clusters)
-
-    # For X * Ct, we use CSR (for X format) x (fullc or CSC for C format) for the best efficiency.
-    # We use row format to store centroids in other places, so must convert them here to column format.
-    if is_centroid_dense:
-        centroids = centroids.ss.export("fullc")
-        centroids = gb.Matrix.ss.import_fullc(**centroids)
+    if gpu:
+        c_squared_norms_host = np.empty((n_samples, n_clusters), order="C", dtype=c_squared_norms.dtype)
+        c_squared_norms_host[:] = c_squared_norms
+        c_squared_norms_device = cp.asarray(c_squared_norms_host, order="C")
+        distances_to_centroids = cupyx.empty_pinned((X.shape[0], centroids.shape[0]), dtype=X.dtype, order="C")
+        centroids = cp.asarray(centroids.to_dense(fill_value=0), dtype=cp.float64, order="C")
+        centroids = cp.asfortranarray(centroids)
+        XCt = spmm(X, centroids.T, c_squared_norms_device, -2, 1)
+        cp.cuda.Stream.null.synchronize()
+        XCt.get(out=distances_to_centroids, blocking=True)
 
     else:
-        centroids = centroids.ss.export("csc")
-        centroids = gb.Matrix.ss.import_csc(**centroids)
+        XCt = Matrix(dtypes.FP64, nrows=n_samples, ncols=n_clusters)
 
-    XCt << 0
-    XCt(accum=gb.binary.plus, nthreads=n_threads) << X.mxm(centroids.T)
-    XCt = 2 * XCt.to_dense()
+        # For X * Ct, we use CSR (for X format) x (fullc or CSC for C format) for the best efficiency.
+        # We use row format to store centroids in other places, so must convert them here to column format.
+        if is_centroid_dense:
+            centroids = centroids.ss.export("fullc")
+            centroids = gb.Matrix.ss.import_fullc(**centroids)
 
-    # x_squared_norms is not needed
-    c_squared_norms = squared_row_norms(centroids, n_threads)
-    distances_to_centroids = -XCt + c_squared_norms[np.newaxis, :]
+        else:
+            centroids = centroids.ss.export("csc")
+            centroids = gb.Matrix.ss.import_csc(**centroids)
+
+        XCt << 0
+        XCt(accum=gb.binary.plus, nthreads=n_threads) << X.mxm(centroids.T)
+        XCt = 2 * XCt.to_dense()
+
+        # x_squared_norms is not needed
+        distances_to_centroids = -XCt + c_squared_norms[np.newaxis, :]
 
     labels = np.argmin(distances_to_centroids, axis=1)
 
     return labels, distances_to_centroids
 
 
-def kmeans_predict(X: Union[sparse.csr_matrix, gb.Matrix], centroids: Union[sparse.csr_matrix, gb.Matrix], n_threads: int=default_threads) -> np.array:
+def kmeans_predict(X: Union[sparse.csr_matrix, gb.Matrix], centroids: Union[sparse.csr_matrix, gb.Matrix], n_threads: int=default_threads, use_gpu: bool=False) -> np.array:
     """Predict cluster for each sample in X given centroids
 
     Parameters
@@ -97,6 +136,9 @@ def kmeans_predict(X: Union[sparse.csr_matrix, gb.Matrix], centroids: Union[spar
         Input centroids
     n_threads : int
         Number of using threads
+
+    use_gpu : `bool`, default=False
+        Whether to use GPU for matrix multiplication.
 
     Returns
     -------
@@ -111,7 +153,7 @@ def kmeans_predict(X: Union[sparse.csr_matrix, gb.Matrix], centroids: Union[spar
 
     centroids, is_centroid_dense = check_centroids_density(centroids)
 
-    labels, _ = predict_labels(X, centroids, is_centroid_dense, n_threads)
+    labels, _ = predict_labels(X, centroids, is_centroid_dense, n_threads, use_gpu)
 
     return labels
 
@@ -126,7 +168,8 @@ class SparseKmeans:
         random_state: Union[
             np.random.randint, np.random.RandomState, int, None
         ] = None,
-        verbose: bool = False
+        verbose: bool = False,
+        use_gpu: bool = False
     ):
         """Sparse K-means clustering.
 
@@ -147,6 +190,9 @@ class SparseKmeans:
         random_state : int, RandomState instance or None, default=None
             Determines random number generation for centroid initialization.
 
+        use_gpu : `bool`, default=False
+            Whether to use GPU for matrix multiplication.
+
         Attributes
         ----------
         centroids : `gb.Matrix`
@@ -164,6 +210,7 @@ class SparseKmeans:
         self.random_state = check_random_state(random_state)
         self.n_threads = n_threads
         self.verbose = verbose
+        self.use_gpu = use_gpu
 
         # Flag to indicate if centroids stored in dense format
         self.is_centroid_dense = False
@@ -217,18 +264,36 @@ class SparseKmeans:
             candidate_ids = np.minimum(candidate_ids, smallest_sq_dist.size - 1)
 
             # Compute squared distances to centroid candidates
-            candidates = Matrix(dtype=dtypes.FP64, nrows=n_local_trials, ncols=n_features)
-            candidates << X[candidate_ids, :]
-            candidates = candidates.ss.export("csc")
-            candidates = gb.Matrix.ss.import_csc(**candidates)
+            if self.use_gpu:
+                cp, cupyx, _, _ = _load_gpu_backend()
+                Xcandidates_t = cupyx.empty_pinned((X.shape[0], n_local_trials), dtype=self.gpu_X.dtype, order="C")
+                candidates = self.gpu_X[candidate_ids]
+                candidates = candidates.toarray()
+                Xcandidates_t_device = self.gpu_X @ candidates.T
+                cp.cuda.Stream.null.synchronize()
+                Xcandidates_t_device.get(out=Xcandidates_t, blocking=True)
 
-            Xcandidates_t = Matrix(dtype=dtypes.FP64, nrows=n_samples, ncols=n_local_trials)
-            Xcandidates_t(nthreads=self.n_threads) << X.mxm(candidates.T)  # CSR * CSR
-            sq_distance_to_candidates = (
-                x_squared_norms[:, np.newaxis]
-                - 2 * Xcandidates_t.to_dense(fill_value=0)
-                + x_squared_norms[candidate_ids][np.newaxis, :]
-            )
+                sq_distance_to_candidates = (
+                    x_squared_norms[:, np.newaxis]
+                    - 2 * Xcandidates_t
+                    + x_squared_norms[candidate_ids][np.newaxis, :]
+                )
+
+            else:
+                candidates = Matrix(dtype=dtypes.FP64, nrows=n_local_trials, ncols=n_features)
+                candidates << X[candidate_ids, :]
+                candidates = candidates.ss.export("csc")
+                candidates = gb.Matrix.ss.import_csc(**candidates)
+
+                Xcandidates_t = Matrix(dtype=dtypes.FP64, nrows=n_samples, ncols=n_local_trials)
+                Xcandidates_t(nthreads=self.n_threads) << X.mxm(candidates.T)  # CSR * CSR
+
+                sq_distance_to_candidates = (
+                    x_squared_norms[:, np.newaxis]
+                    - 2 * Xcandidates_t.to_dense(fill_value=0)
+                    + x_squared_norms[candidate_ids][np.newaxis, :]
+                )
+
             sq_distance_to_candidates = sq_distance_to_candidates.T
 
             # Find the smallest squared distance from data to candidtaes
@@ -260,7 +325,10 @@ class SparseKmeans:
             # Decide to store centroids in dense/sparse format based on density
             self.centroids, self.is_centroid_dense = check_centroids_density(self.centroids)
 
-            self._assign_cluster(X)
+            if self.use_gpu:
+                self._assign_cluster(self.gpu_X)
+            else:
+                self._assign_cluster(X)
 
             if iter > 0:
                 if self._converged():
@@ -296,7 +364,14 @@ class SparseKmeans:
 
         n_samples = X.shape[0]
         print("Total samples: ", n_samples)
-
+        # Force all data to FP64 to avoid data type casting during matrix multiplication, which may degrade performance.
+        if self.use_gpu:
+            _, _, csp, _ = _load_gpu_backend()
+            if isinstance(X, gb.Matrix):
+                X_scipy_csr = sparse.csr_matrix(gb.io.to_scipy_sparse(X, format="csr"), dtype=np.float64)
+            else:
+                X_scipy_csr = sparse.csr_matrix(X, dtype=np.float64)
+            self.gpu_X = _scipy_csr_to_cupy_csr(X_scipy_csr)
         if not isinstance(X, gb.Matrix):
             X = gb.io.from_scipy_sparse(X)
         if X.dtype != dtypes.FP64:
@@ -307,7 +382,7 @@ class SparseKmeans:
         end_init_centroids = time.time()
 
         if self.verbose:
-            print("Initialze Centroids time: ", end_init_centroids - start_init_centroids)
+            print("Initialize Centroids time: ", end_init_centroids - start_init_centroids)
 
         self._single_kmeans(X)
 
@@ -315,13 +390,16 @@ class SparseKmeans:
 
         return self.labels
 
-    def predict(self, X: gb.Matrix):
+    def predict(self, X: Union[sparse.csr_matrix, gb.Matrix], use_gpu: bool = False):
         """Predict the closest cluster for each sample in X
 
         Parameters
         ----------
         X : `gb.Matrix, scipy.sparse.csr_matrix` (csr format)
             Input dataset for predicting label
+
+        use_gpu : `bool`, default=False
+            Whether to use GPU for matrix multiplication.
 
         Returns
         -------
@@ -338,7 +416,7 @@ class SparseKmeans:
         if not isinstance(X, gb.Matrix):
             X = gb.io.from_scipy_sparse(X)
 
-        labels, _ = predict_labels(X, self.centroids, self.is_centroid_dense, self.n_threads)
+        labels, _ = predict_labels(X, self.centroids, self.is_centroid_dense, self.n_threads, use_gpu)
 
         return labels
 
@@ -433,7 +511,7 @@ class SparseKmeans:
     def _update_internal_state(self, *args, **kargs):
         pass
 
-    def _cleanup(self, keep=['centroids', 'labels', 'is_fitted', 'is_centroid_dense', 'n_threads', 'verbose', 'random_state', 'n_clusters', 'max_iter', 'tol']):
+    def _cleanup(self, keep=['centroids', 'labels', 'is_fitted', 'is_centroid_dense', 'n_threads', 'verbose', 'random_state', 'n_clusters', 'max_iter', 'tol', 'use_gpu']):
         for attr in list(self.__dict__.keys()):
             if attr not in keep:
                 delattr(self, attr)
@@ -444,8 +522,8 @@ class LloydKmeans(SparseKmeans):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-    def _assign_cluster(self, X: gb.Matrix):
-        self.labels, distances_to_centroids = predict_labels(X, self.centroids, self.is_centroid_dense, self.n_threads)
+    def _assign_cluster(self, X: Union[gb.Matrix, csp.csr_matrix]):
+        self.labels, distances_to_centroids = predict_labels(X, self.centroids, self.is_centroid_dense, self.n_threads, gpu=self.use_gpu)
         np.min(distances_to_centroids, axis=1, out=self.sample_centroids_closest_distance)
 
         # Preventing memory issue with mxm operation
@@ -464,6 +542,11 @@ class LloydKmeans(SparseKmeans):
 class ElkanKmeans(SparseKmeans):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
+
+        if self.use_gpu:
+            raise ValueError(
+                "GPU support is currently available only for LloydKmeans."
+            )
 
     def _assign_cluster(self, X: gb.Matrix):
         n_samples = X.shape[0]
