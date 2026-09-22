@@ -2,7 +2,7 @@ from setuptools import setup
 
 PACKAGE_DIR = ["sparsekmeans"]
 PACKAGE_NAME = "sparsekmeans"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 
 
 # license parameters
@@ -17,8 +17,8 @@ setup(
     version=VERSION,
     python_requires=">=3.10",
     install_requires=["numpy","python-graphblas","scipy"],
-    extras_require={"gpu-cu12": ["cupy-cuda12x"],
-                    "gpu-cu13": ["cupy-cuda13x"],
+    extras_require={"gpu-cu12": ["cupy-cuda12x[ctk]"],
+                    "gpu-cu13": ["cupy-cuda13x[ctk]"],
                     },
     description="A package for efficient implementation of the K-means clustering on high-dimensional sparse data sets",
     long_description="See documentation here: https://github.com/cjlin1/sparsekmeans",
