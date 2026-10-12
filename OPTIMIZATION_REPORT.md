@@ -1,7 +1,5 @@
 # sparsekmeans: memory and running-time optimization
 
-Branch: `optimize-memory-time` (changes in `sparsekmeans/sparse_kmeans.py` only; not yet committed).
-
 ## Summary
 
 On the README benchmark datasets (Amazon-670K and Url, K=100), the new version is faster in every configuration (6–43%) and uses 42–58% less peak memory, with identical clustering results (same inertia to all printed digits).
