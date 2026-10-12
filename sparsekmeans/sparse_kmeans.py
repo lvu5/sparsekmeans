@@ -43,12 +43,18 @@ def check_random_state(seed: Union[int, None]):
         # Returns a RandomState object seeded with given integer
         return np.random.RandomState(seed)
 
+def _labels_dtype(n_clusters: int):
+    # Use the smallest integer type that can store all cluster indices
+    return np.int16 if n_clusters <= np.iinfo(np.int16).max + 1 else np.int32
+
+
 def squared_row_norms(X: gb.Matrix, n_threads: int=default_threads):
-    sq_X = Matrix(dtypes.FP64, X.shape[0], X.shape[1])
-    sq_X(nthreads=n_threads) << X.ewise_mult(X, op="times")
+    # Compute sum_j X_ij^2 by multiplying X with a vector of 2s under the plus_pow semiring.
+    # The vector is iso-valued and takes O(1) memory, so no squared copy of X is created.
+    twos = Vector.from_scalar(2.0, size=X.shape[1], dtype=dtypes.FP64)
 
     sq_row_norms = Vector(dtypes.FP64, X.shape[0])
-    sq_row_norms(nthreads=n_threads) << sq_X.reduce_rowwise("plus")
+    sq_row_norms(nthreads=n_threads) << X.mxv(twos, gb.semiring.plus_pow)
 
     return sq_row_norms.to_dense(fill_value=0)
 
@@ -58,7 +64,7 @@ def check_centroids_density(centroids: gb.Matrix):
 
     if centroids.ss.format == "fullr":
         is_centroid_dense = True
-        centroids_density = centroids.V.new().nvals / (centroids.nrows * centroids.ncols)
+        centroids_density = centroids.reduce_scalar(gb.agg.count_nonzero).new().value / (centroids.nrows * centroids.ncols)
         if centroids_density <= gamma:
             is_centroid_dense = False
             centroids(mask=centroids.V, replace=True) << centroids
@@ -67,12 +73,26 @@ def check_centroids_density(centroids: gb.Matrix):
         centroids_density = centroids.nvals / (centroids.nrows * centroids.ncols)
         if centroids_density > gamma:
             is_centroid_dense = True
-            centroids(mask=~centroids.S) << 0
+            centroids = _to_full(centroids)
 
     return centroids, is_centroid_dense
 
 
+def _to_full(A: gb.Matrix, n_threads: int=default_threads):
+    # Return a new matrix storing A in the full format, with zeros for the missing entries.
+    # Assigning zeros with the mask ~A.S instead keeps A in a sparse format that stores all
+    # entries together with their indices, which takes much more memory.
+    A_full = Matrix(dtypes.FP64, nrows=A.nrows, ncols=A.ncols)
+    A_full << 0
+    A_full(accum=gb.binary.plus, nthreads=n_threads) << A
+
+    return A_full
+
+
 def predict_labels(X: Union[gb.Matrix, csp.csr_matrix], centroids: gb.Matrix, is_centroid_dense: bool, n_threads: int=default_threads, gpu: bool=False):
+    """Return the closest centroid of each sample and the corresponding squared distance
+    (up to the omitted constant ||x||^2, which does not affect the argmin).
+    """
     # Force all data to FP64 to avoid data type casting during matrix multiplication, which may degrade performance.
     if gpu:
         cp, cupyx, csp, spmm = _load_gpu_backend()
@@ -90,39 +110,78 @@ def predict_labels(X: Union[gb.Matrix, csp.csr_matrix], centroids: gb.Matrix, is
     # x_squared_norms is not needed
     c_squared_norms = squared_row_norms(centroids, n_threads)
     if gpu:
-        c_squared_norms_host = np.empty((n_samples, n_clusters), order="C", dtype=c_squared_norms.dtype)
-        c_squared_norms_host[:] = c_squared_norms
-        c_squared_norms_device = cp.asarray(c_squared_norms_host, order="C")
-        distances_to_centroids = cupyx.empty_pinned((X.shape[0], centroids.shape[0]), dtype=X.dtype, order="C")
+        # Initialize the output with the centroid norms directly on the device and reduce it there,
+        # so no (n_samples x n_clusters) array is allocated or transferred on the host.
+        distances_to_centroids = cp.empty((n_samples, n_clusters), dtype=cp.float64, order="C")
+        distances_to_centroids[...] = cp.asarray(c_squared_norms, dtype=cp.float64)
         centroids = cp.asarray(centroids.to_dense(fill_value=0), dtype=cp.float64, order="C")
         centroids = cp.asfortranarray(centroids)
-        XCt = spmm(X, centroids.T, c_squared_norms_device, -2, 1)
-        cp.cuda.Stream.null.synchronize()
-        XCt.get(out=distances_to_centroids, blocking=True)
+        distances_to_centroids = spmm(X, centroids.T, distances_to_centroids, -2, 1)
+        del centroids
+
+        labels = cp.argmin(distances_to_centroids, axis=1).get()
+        closest_distances = cp.min(distances_to_centroids, axis=1).get()
 
     else:
-        XCt = Matrix(dtypes.FP64, nrows=n_samples, ncols=n_clusters)
+        # For X * Ct, we use CSR (for X format) x (fullr or CSR for Ct format) for the best efficiency.
+        # We use row format to store centroids in other places, so must materialize Ct here. This makes a
+        # single copy, which is cheaper than converting a copy of the centroids to column format.
+        Ct = Matrix(dtypes.FP64, nrows=centroids.ncols, ncols=n_clusters)
+        Ct(nthreads=n_threads) << centroids.T
 
-        # For X * Ct, we use CSR (for X format) x (fullc or CSC for C format) for the best efficiency.
-        # We use row format to store centroids in other places, so must convert them here to column format.
-        if is_centroid_dense:
-            centroids = centroids.ss.export("fullc")
-            centroids = gb.Matrix.ss.import_fullc(**centroids)
+        labels, closest_distances = _closest_centroids(X, Ct, c_squared_norms, n_threads)
 
+        # GraphBLAS objects are in reference cycles and may be freed only by the garbage collector,
+        # so explicitly release the memory of large temporaries.
+        Ct.clear()
+
+    return labels, closest_distances
+
+
+# Minimum upper bound on the size of the dense block of XCt computed at once. Processing samples in blocks
+# bounds the memory of distance computation, but each block must be copied out of X. The bound is therefore
+# raised to the size of X, so blocks are used only when XCt would take more memory than X itself.
+_DISTANCE_BLOCK_BYTES = 256 * 2**20
+
+
+def _closest_centroids(X: gb.Matrix, Ct: gb.Matrix, c_squared_norms: np.ndarray, n_threads: int=default_threads):
+    n_samples = X.shape[0]
+    n_clusters = Ct.shape[1]
+
+    labels = np.empty(n_samples, dtype=np.intp)
+    closest_distances = np.empty(n_samples, dtype=np.float64)
+
+    block_bytes = max(_DISTANCE_BLOCK_BYTES, X.ss.nbytes)
+    block_size = max(n_threads, block_bytes // (8 * n_clusters))
+    for start in range(0, n_samples, block_size):
+        end = min(start + block_size, n_samples)
+        is_block = not (start == 0 and end == n_samples)
+        if is_block:
+            X_block = Matrix(dtypes.FP64, nrows=end - start, ncols=X.shape[1])
+            X_block(nthreads=n_threads) << X[start:end, :]
         else:
-            centroids = centroids.ss.export("csc")
-            centroids = gb.Matrix.ss.import_csc(**centroids)
+            X_block = X
 
+        XCt = Matrix(dtypes.FP64, nrows=end - start, ncols=n_clusters)
         XCt << 0
-        XCt(accum=gb.binary.plus, nthreads=n_threads) << X.mxm(centroids.T)
-        XCt = 2 * XCt.to_dense()
+        XCt(accum=gb.binary.plus, nthreads=n_threads) << X_block.mxm(Ct)
+        if is_block:
+            # Explicitly release the memory as GraphBLAS objects may be freed only by the garbage collector
+            X_block.clear()
 
+        # Take over the dense buffer of XCt without a copy and compute -2 * XCt + ||c||^2 in place.
         # x_squared_norms is not needed
-        distances_to_centroids = -XCt + c_squared_norms[np.newaxis, :]
+        if XCt.ss.is_iso:
+            distances_to_centroids = XCt.to_dense()
+        else:
+            distances_to_centroids = XCt.ss.export("fullr", give_ownership=True)["values"]
+        distances_to_centroids *= -2
+        distances_to_centroids += c_squared_norms[np.newaxis, :]
 
-    labels = np.argmin(distances_to_centroids, axis=1)
+        np.argmin(distances_to_centroids, axis=1, out=labels[start:end])
+        np.min(distances_to_centroids, axis=1, out=closest_distances[start:end])
 
-    return labels, distances_to_centroids
+    return labels, closest_distances
 
 
 def kmeans_predict(X: Union[sparse.csr_matrix, gb.Matrix], centroids: Union[sparse.csr_matrix, gb.Matrix], n_threads: int=default_threads, use_gpu: bool=False) -> np.array:
@@ -223,15 +282,16 @@ class SparseKmeans:
 
         n_samples, n_features = X.shape
         n_clusters = self.n_clusters
-        x_squared_norms = squared_row_norms(X, self.n_threads)
+        x_squared_norms = self.x_squared_norms
 
-        centroids = Matrix(dtype=dtypes.FP64, nrows=n_clusters, ncols=n_features)
+        # Record the selected samples and extract them at once after the selection
+        centroid_ids = np.empty(n_clusters, dtype=np.int64)
 
         # We can simply use self.random_state.choice(n_samples), but instead follow scikit-learn to allow
         # weights for the selection. Also, the two ways may give different results.
-        first_centroid_id = self.random_state.choice(n_samples, p=[1 / n_samples] * n_samples)
+        first_centroid_id = self.random_state.choice(n_samples, p=np.full(n_samples, 1 / n_samples))
 
-        centroids[0, :] << X[first_centroid_id, :]
+        centroid_ids[0] = first_centroid_id
 
         Xc = Vector(dtype=dtypes.FP64, size=n_samples)
         Xc(nthreads=self.n_threads) << X.mxv(X[first_centroid_id, :])
@@ -249,7 +309,7 @@ class SparseKmeans:
 
             if current_potential < 1e-12:
                 warnings.warn(f"The specified number of clusters is larger than the number of distinct points.\nChange the number of clusters to the number of distinct points.", category=UserWarning)
-                centroids = centroids[:j, :]
+                centroid_ids = centroid_ids[:j]
                 self.n_clusters = j
                 break
 
@@ -293,6 +353,8 @@ class SparseKmeans:
                     - 2 * Xcandidates_t.to_dense(fill_value=0)
                     + x_squared_norms[candidate_ids][np.newaxis, :]
                 )
+                # Explicitly release the memory as GraphBLAS objects may be freed only by the garbage collector
+                Xcandidates_t.clear()
 
             sq_distance_to_candidates = sq_distance_to_candidates.T
 
@@ -307,7 +369,10 @@ class SparseKmeans:
             current_potential = candidates_potential[best_candidate]
             smallest_sq_dist = sq_distance_to_candidates[best_candidate]
 
-            centroids[j, :] << X[candidate_ids[best_candidate], :]
+            centroid_ids[j] = candidate_ids[best_candidate]
+
+        centroids = Matrix(dtype=dtypes.FP64, nrows=len(centroid_ids), ncols=n_features)
+        centroids(nthreads=self.n_threads) << X[centroid_ids, :]
 
         return centroids
 
@@ -315,7 +380,6 @@ class SparseKmeans:
         # Allowing the kmeans procedure to allocate and initialize internal variables
         self._setup_internal_state(X)
 
-        self.mean_feature_variance = self._cal_feature_variance(X)
         if self.mean_feature_variance <= sys.float_info.min:
             return
 
@@ -323,7 +387,12 @@ class SparseKmeans:
             start_iter = time.time()
 
             # Decide to store centroids in dense/sparse format based on density
-            self.centroids, self.is_centroid_dense = check_centroids_density(self.centroids)
+            centroids, self.is_centroid_dense = check_centroids_density(self.centroids)
+            if centroids is not self.centroids:
+                # Explicitly release the memory as GraphBLAS objects may be freed only by the garbage collector
+                self.centroids.clear()
+                self.centroids = centroids
+            del centroids
 
             if self.use_gpu:
                 self._assign_cluster(self.gpu_X)
@@ -334,8 +403,14 @@ class SparseKmeans:
                 if self._converged():
                     break
 
-            self.old_centroids = self.centroids
+            old_centroids = self.centroids
             self.centroids = self._update_centroids(X)
+
+            # The old centroids are not needed afterward, so the shift is computed in place on them
+            self.centroids_shift = self._cal_centroids_shift(old_centroids)
+            # Explicitly release the memory as GraphBLAS objects may be freed only by the garbage collector
+            old_centroids.clear()
+            del old_centroids
 
             # Allowing the kmeans procedure to update internal variables
             self._update_internal_state()
@@ -363,7 +438,8 @@ class SparseKmeans:
         """
 
         n_samples = X.shape[0]
-        print("Total samples: ", n_samples)
+        if self.verbose:
+            print("Total samples: ", n_samples)
         # Force all data to FP64 to avoid data type casting during matrix multiplication, which may degrade performance.
         if self.use_gpu:
             _, _, csp, _ = _load_gpu_backend()
@@ -372,10 +448,15 @@ class SparseKmeans:
             else:
                 X_scipy_csr = sparse.csr_matrix(X, dtype=np.float64)
             self.gpu_X = _scipy_csr_to_cupy_csr(X_scipy_csr)
+            # The host copy is no longer needed after being moved to the device
+            del X_scipy_csr
         if not isinstance(X, gb.Matrix):
             X = gb.io.from_scipy_sparse(X)
         if X.dtype != dtypes.FP64:
             X = X.dup(dtype="FP64")
+
+        # Squared norms of samples are shared by the initialization, the feature variance, and Elkan's method
+        self.x_squared_norms = squared_row_norms(X, self.n_threads)
 
         start_init_centroids = time.time()
         self.centroids = self._initialize_centroids(X)
@@ -475,35 +556,38 @@ class SparseKmeans:
     def _setup_internal_state(self, X: gb.Matrix):
         n_samples = X.shape[0]
 
-        self.labels = np.zeros(n_samples, dtype=np.int16)
+        self.labels = np.zeros(n_samples, dtype=_labels_dtype(self.n_clusters))
 
         # Maintain the distance between each sample and the assigned centroid
         # We need the distances in the function update_centroids for handling empty clusters
         self.sample_centroids_closest_distance = np.zeros(n_samples, dtype=np.float64)
 
+        self.mean_feature_variance = self._cal_feature_variance(X)
+
         return
 
-    def _cal_centroids_shift(self):
-        n_clusters, n_features = self.centroids.shape
-
-        centroids_shift_squared = Matrix(dtypes.FP64, nrows=n_clusters, ncols=n_features)
-        centroids_shift_squared(nthreads=self.n_threads) << self.centroids.ewise_union(
-            self.old_centroids, op="minus", left_default=0, right_default=0
-        )
-        centroids_shift_squared = squared_row_norms(centroids_shift_squared, self.n_threads)
+    def _cal_centroids_shift(self, old_centroids: gb.Matrix):
+        # Overwrite old_centroids by old_centroids - centroids to avoid allocating another matrix.
+        # Entries only in centroids keep their sign, which does not affect the squared norms.
+        old_centroids(accum=gb.binary.minus, nthreads=self.n_threads) << self.centroids
+        centroids_shift_squared = squared_row_norms(old_centroids, self.n_threads)
 
         centroids_shift = np.sqrt(centroids_shift_squared)
 
         return centroids_shift
 
     def _cal_feature_variance(self, X: gb.Matrix):
-        n_samples = X.shape[0]
+        n_samples, n_features = X.shape
 
-        means = X.reduce_columnwise(op="add").to_dense(fill_value=0) / n_samples
-        sum_squared = (X ** 2).reduce_columnwise(op="add").to_dense(fill_value=0)
-        variances = (sum_squared - n_samples * (means ** 2)) / n_samples
+        # The mean of the feature variances is (sum_j sum_i X_ij^2 - n_samples * sum_j means_j^2) / (n_samples * n_features).
+        # The first sum is the sum of the squared row norms, and only nonzero column sums contribute to the second,
+        # so no dense array of length n_features is needed.
+        column_sums = Vector(dtypes.FP64, n_features)
+        column_sums(nthreads=self.n_threads) << X.reduce_columnwise(op="add")
+        _, column_sums = column_sums.to_coo(indices=False)
+        means = column_sums / n_samples
 
-        return np.mean(variances)
+        return (self.x_squared_norms.sum() - n_samples * (means ** 2).sum()) / (n_samples * n_features)
 
     def _converged(self):
         pass
@@ -523,8 +607,7 @@ class LloydKmeans(SparseKmeans):
         super().__init__(**kwargs)
 
     def _assign_cluster(self, X: Union[gb.Matrix, csp.csr_matrix]):
-        self.labels, distances_to_centroids = predict_labels(X, self.centroids, self.is_centroid_dense, self.n_threads, gpu=self.use_gpu)
-        np.min(distances_to_centroids, axis=1, out=self.sample_centroids_closest_distance)
+        self.labels, self.sample_centroids_closest_distance = predict_labels(X, self.centroids, self.is_centroid_dense, self.n_threads, gpu=self.use_gpu)
 
         # Preventing memory issue with mxm operation
         gc.collect()
@@ -533,8 +616,7 @@ class LloydKmeans(SparseKmeans):
 
     def _converged(self):
 
-        centroids_shift = self._cal_centroids_shift()
-        tol = (centroids_shift**2).sum()
+        tol = (self.centroids_shift**2).sum()
 
         return tol <= self.mean_feature_variance * self.tol
 
@@ -552,13 +634,21 @@ class ElkanKmeans(SparseKmeans):
         n_samples = X.shape[0]
         n_clusters = self.centroids.shape[0]
 
-        samples_idx = np.arange(n_samples)
-
         c_squared_norms = squared_row_norms(self.centroids, self.n_threads)
 
-        CCt = Matrix(dtypes.FP64, nrows=n_clusters, ncols=n_clusters)
-        CCt(nthreads=self.n_threads) << self.centroids.mxm(self.centroids.T)
-        CCt = CCt.to_dense(fill_value=0)
+        if self.centroids.ss.format == "fullr" and not self.centroids.ss.is_iso:
+            # For dense centroids, GraphBLAS computes n_clusters^2 independent dot products of long rows, which is
+            # bounded by memory bandwidth. Instead, apply cache-efficient BLAS to the buffer of the centroids,
+            # which is temporarily taken from GraphBLAS without a copy.
+            centroids_values = self.centroids.ss.unpack("fullr")["values"]
+            try:
+                CCt = centroids_values @ centroids_values.T
+            finally:
+                self.centroids.ss.pack_fullr(centroids_values, take_ownership=True)
+        else:
+            CCt = Matrix(dtypes.FP64, nrows=n_clusters, ncols=n_clusters)
+            CCt(nthreads=self.n_threads) << self.centroids.mxm(self.centroids.T)
+            CCt = CCt.to_dense(fill_value=0)
 
         half_centroid_centroid_distances = c_squared_norms[:, np.newaxis] - 2 * CCt + c_squared_norms[np.newaxis, :]
         np.clip(half_centroid_centroid_distances, 0, None, out=half_centroid_centroid_distances)
@@ -573,7 +663,10 @@ class ElkanKmeans(SparseKmeans):
 
         # Always use dense centroids for calculating samples_centroids_product here and Xcj in the loop
         if self.centroids.ss.format != "fullr":
-            self.centroids(~self.centroids.S) << 0
+            centroids = _to_full(self.centroids, self.n_threads)
+            # Explicitly release the memory as GraphBLAS objects may be freed only by the garbage collector
+            self.centroids.clear()
+            self.centroids = centroids
 
         samples_centroids_product(mask=samples_centroids_mask.S, nthreads=self.n_threads) << X.mxm(self.centroids.T)
         samples_centroids_product = samples_centroids_product.reduce_rowwise(gb.binary.min).to_dense(fill_value=0)
@@ -585,19 +678,21 @@ class ElkanKmeans(SparseKmeans):
         for j in range(n_clusters):
 
             # Apply two conditions first to get a subset as half_centroid_centroid_distances[j, labels] expensively expand a small array to a larger one
-            candidate_idx = samples_idx[(self.labels != j) & (self.sample_centroids_closest_distance > self.lower_bounds[j, :])]
+            candidate_idx = np.flatnonzero((self.labels != j) & (self.sample_centroids_closest_distance > self.lower_bounds[j, :]))
             candidate_idx = candidate_idx[self.sample_centroids_closest_distance[candidate_idx] > half_centroid_centroid_distances[j, self.labels[candidate_idx]]]
 
             if len(candidate_idx) == 0:
                 continue
 
-            Xcj = Vector(dtypes.FP64, size=n_samples)
+            # Start from explicit zeros at the candidates so that the result has exactly one value per candidate,
+            # in the order of candidate_idx, without expanding it to a dense vector of length n_samples
+            Xcj = Vector.from_coo(candidate_idx, 0.0, size=n_samples, dtype=dtypes.FP64)
             Xcj_mask = Vector.from_coo(candidate_idx, 1, size=n_samples)
 
             # Update lower bounds according to new centroids
-            Xcj(mask=Xcj_mask.S, nthreads=self.n_threads) << X.mxv(self.centroids[j, :])
-            Xcj = Xcj.to_dense(fill_value=0)
-            distance_to_cj = self.x_squared_norms[candidate_idx] - 2 * Xcj[candidate_idx] + c_squared_norms[j]
+            Xcj(mask=Xcj_mask.S, accum=gb.binary.plus, nthreads=self.n_threads) << X.mxv(self.centroids[j, :])
+            _, Xcj = Xcj.to_coo(indices=False)
+            distance_to_cj = self.x_squared_norms[candidate_idx] - 2 * Xcj + c_squared_norms[j]
             np.clip(distance_to_cj, 0, None, out=distance_to_cj)
             distance_to_cj = np.sqrt(distance_to_cj)
             self.lower_bounds[j, candidate_idx] = distance_to_cj
@@ -619,24 +714,14 @@ class ElkanKmeans(SparseKmeans):
         return
 
     def _setup_internal_state(self, X: gb.Matrix):
-        n_samples = X.shape[0]
+        super()._setup_internal_state(X)
 
-        self.labels = np.zeros(n_samples, dtype=np.int16)
-
-        # Maintain the distance between each sample and the assigned centroid
-        # We need the distances in the function update_centroids for handling empty clusters
-        self.sample_centroids_closest_distance = np.zeros(n_samples, dtype=np.float64)
-
-        self.x_squared_norms = squared_row_norms(X, self.n_threads)
-
-        self.lower_bounds = np.zeros((self.n_clusters, n_samples), dtype=np.float64)
-
-        self.mean_feature_variance = self._cal_feature_variance(X)
+        # self.x_squared_norms is computed in fit
+        self.lower_bounds = np.zeros((self.n_clusters, X.shape[0]), dtype=np.float64)
 
         return
 
     def _update_internal_state(self):
-        self.centroids_shift = self._cal_centroids_shift()
         self.lower_bounds -= self.centroids_shift[:, np.newaxis]
         np.maximum(self.lower_bounds, 0, self.lower_bounds)
 
